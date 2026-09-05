@@ -2,7 +2,7 @@
 
 A GitHub CLI extension that polls a single PR and reports every actionable event, enabling automated fix/review loops to react to changes in real time.
 
-Unlike `gh pr checks --watch`, which only tracks CI checks, `gh pr-monitor` detects all significant PR changes: CI check pass/fail, new/updated PR reviews (approve/changes-requested/comment), new/updated comments (top-level and inline/diff), reviewer/team requests added, and mergeable-state changes (conflicts, out-of-date branch).
+Unlike `gh pr checks --watch`, which only tracks CI checks, `gh pr-monitor` detects all significant PR changes: CI check pass/fail, new/updated/deleted PR reviews (approve/changes-requested/comment), new/updated/deleted comments (top-level and inline/diff), reviewer/team requests added, PR description edits, and mergeable-state changes (conflicts, out-of-date branch).
 
 ## Install
 
@@ -49,11 +49,15 @@ gh pr-monitor 42 --repo owner/repo --json --until-mergeable
 Each poll reports changes as one of these event types:
 
 - **comment** — new or edited top-level PR comment
+- **comment_deleted** — top-level PR comment removed
 - **review** — new or updated PR review (APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED, PENDING)
+- **review_deleted** — review removed (rare — GitHub only allows deleting a PENDING review directly, but a review can also disappear as a side effect of deleting its last remaining comment)
 - **review_request** — reviewer or team added to review queue
 - **inline_comment** — new or edited diff/review comment on a specific file and line
+- **inline_comment_deleted** — diff/review comment removed
 - **check** — status check or CI job changed state (e.g., PENDING → COMPLETED, conclusion updated)
 - **mergeable** — PR mergeable state or merge status changed (conflicts, out-of-date branch, etc.)
+- **description** — the PR's description (body) was edited
 
 ## Output Formats
 

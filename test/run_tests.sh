@@ -105,6 +105,19 @@ assert_equal "[]" "$diff" "Test 13: unchanged review request"
 stripped=$(jq -rn --arg s $'line1\x1b[2Jline2\r' '$s | gsub("[[:cntrl:]]"; " ")')
 assert_equal "line1 [2Jline2 " "$stripped" "Test 14: control-char stripping"
 
+# Test 15: diff_removed_by_key reports an item present in prev but gone from curr
+diff=$(diff_removed_by_key '[{"id":1,"body":"a"},{"id":2,"body":"b"}]' '[{"id":1,"body":"a"}]' "id")
+ids=$(jq -c 'map(.id)' <<<"$diff")
+assert_equal "[2]" "$ids" "Test 15: deletion detected"
+
+# Test 16: diff_removed_by_key reports nothing when nothing was removed (only added)
+diff=$(diff_removed_by_key '[{"id":1,"body":"a"}]' '[{"id":1,"body":"a"},{"id":2,"body":"b"}]' "id")
+assert_equal "[]" "$diff" "Test 16: no false-positive deletion on pure addition"
+
+# Test 17: diff_removed_by_key does not confuse an edit with a deletion
+diff=$(diff_removed_by_key '[{"id":1,"body":"a"}]' '[{"id":1,"body":"EDITED"}]' "id")
+assert_equal "[]" "$diff" "Test 17: edited item is not reported as deleted"
+
 echo ""
 echo "Tests passed: $tests_passed"
 echo "Tests failed: $tests_failed"

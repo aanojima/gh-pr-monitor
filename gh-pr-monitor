@@ -14,6 +14,18 @@ diff_by_key() {
   ' <<<"$prev"$'\n'"$curr"
 }
 
+# Diff two JSON arrays by a key field, returning elements present in prev but absent
+# from curr (deletions). Same stdin-passing approach as diff_by_key, for the same reason.
+diff_removed_by_key() {
+  local prev="$1" curr="$2" key="$3"
+  jq -c -n --arg key "$key" '
+    (input) as $prev
+    | (input) as $curr
+    | ($curr | map({(.[$key] | tostring): true}) | add // {}) as $c
+    | [ $prev[] | select(($c[(.[$key] | tostring)] // false) | not) ]
+  ' <<<"$prev"$'\n'"$curr"
+}
+
 main() {
   local interval=15
   local once_mode=false
@@ -102,7 +114,7 @@ EOF
 
   # Fetch initial PR data
   local pr_json
-  if ! pr_json=$(gh pr view "${target_args[@]+"${target_args[@]}"}" "${repo_args[@]+"${repo_args[@]}"}" --json number,url,state,comments,reviews,reviewRequests,reviewDecision,statusCheckRollup,mergeable,mergeStateStatus 2>&1); then
+  if ! pr_json=$(gh pr view "${target_args[@]+"${target_args[@]}"}" "${repo_args[@]+"${repo_args[@]}"}" --json number,url,state,body,comments,reviews,reviewRequests,reviewDecision,statusCheckRollup,mergeable,mergeStateStatus 2>&1); then
     echo "$pr_json" >&2
     exit 1
   fi
@@ -148,7 +160,7 @@ EOF
   echo "watching PR #$pr_number ($pr_url), polling every ${interval}s ..." >&2
 
   # Initialize state
-  local prev_comments prev_reviews prev_review_requests prev_inline_comments prev_checks prev_mergeable prev_merge_state
+  local prev_comments prev_reviews prev_review_requests prev_inline_comments prev_checks prev_mergeable prev_merge_state prev_body
   prev_comments=$(jq -c '.comments // []' <<<"$pr_json")
   prev_reviews=$(jq -c '.reviews // []' <<<"$pr_json")
   prev_review_requests=$(jq -c '.reviewRequests // []' <<<"$pr_json")
@@ -156,13 +168,14 @@ EOF
   prev_checks=$(jq -c '.statusCheckRollup // []' <<<"$pr_json")
   prev_mergeable=$(jq -r '.mergeable' <<<"$pr_json")
   prev_merge_state=$(jq -r '.mergeStateStatus' <<<"$pr_json")
+  prev_body=$(jq -r '.body // ""' <<<"$pr_json")
 
   # Main polling loop
   while true; do
     sleep "$interval"
 
     # Fetch updated PR data
-    if ! pr_json=$(gh pr view "${target_args[@]+"${target_args[@]}"}" "${repo_args[@]+"${repo_args[@]}"}" --json number,url,state,comments,reviews,reviewRequests,reviewDecision,statusCheckRollup,mergeable,mergeStateStatus 2>&1); then
+    if ! pr_json=$(gh pr view "${target_args[@]+"${target_args[@]}"}" "${repo_args[@]+"${repo_args[@]}"}" --json number,url,state,body,comments,reviews,reviewRequests,reviewDecision,statusCheckRollup,mergeable,mergeStateStatus 2>&1); then
       echo "$pr_json" >&2
       exit 1
     fi
@@ -180,13 +193,14 @@ EOF
     inline_comments_json=$(gh api "repos/$owner_repo/pulls/$pr_number/comments" --paginate 2>/dev/null) || inline_fetch_status=$?
 
     # Extract current state
-    local curr_comments curr_reviews curr_review_requests curr_checks curr_mergeable curr_merge_state
+    local curr_comments curr_reviews curr_review_requests curr_checks curr_mergeable curr_merge_state curr_body
     curr_comments=$(jq -c '.comments // []' <<<"$pr_json")
     curr_reviews=$(jq -c '.reviews // []' <<<"$pr_json")
     curr_review_requests=$(jq -c '.reviewRequests // []' <<<"$pr_json")
     curr_checks=$(jq -c '.statusCheckRollup // []' <<<"$pr_json")
     curr_mergeable=$(jq -r '.mergeable' <<<"$pr_json")
     curr_merge_state=$(jq -r '.mergeStateStatus' <<<"$pr_json")
+    curr_body=$(jq -r '.body // ""' <<<"$pr_json")
 
     local timestamp
     timestamp=$(date -u +%FT%TZ)
@@ -197,12 +211,22 @@ EOF
     if [[ -n "$new_comments" && "$new_comments" != "[]" ]]; then
       emit_events_human_or_json "comment" "$new_comments" "$json_mode" "$timestamp"
     fi
+    local deleted_comments
+    deleted_comments=$(diff_removed_by_key "$prev_comments" "$curr_comments" "id")
+    if [[ -n "$deleted_comments" && "$deleted_comments" != "[]" ]]; then
+      emit_events_human_or_json "comment_deleted" "$deleted_comments" "$json_mode" "$timestamp"
+    fi
 
     # Emit events for changed reviews
     local new_reviews
     new_reviews=$(diff_by_key "$prev_reviews" "$curr_reviews" "id")
     if [[ -n "$new_reviews" && "$new_reviews" != "[]" ]]; then
       emit_events_human_or_json "review" "$new_reviews" "$json_mode" "$timestamp"
+    fi
+    local deleted_reviews
+    deleted_reviews=$(diff_removed_by_key "$prev_reviews" "$curr_reviews" "id")
+    if [[ -n "$deleted_reviews" && "$deleted_reviews" != "[]" ]]; then
+      emit_events_human_or_json "review_deleted" "$deleted_reviews" "$json_mode" "$timestamp"
     fi
 
     # Emit events for review requests (key by login/team name — these objects have no stable id)
@@ -222,6 +246,11 @@ EOF
       new_inline_comments=$(diff_by_key "$prev_inline_comments" "$inline_comments_json" "id")
       if [[ -n "$new_inline_comments" && "$new_inline_comments" != "[]" ]]; then
         emit_events_human_or_json "inline_comment" "$new_inline_comments" "$json_mode" "$timestamp"
+      fi
+      local deleted_inline_comments
+      deleted_inline_comments=$(diff_removed_by_key "$prev_inline_comments" "$inline_comments_json" "id")
+      if [[ -n "$deleted_inline_comments" && "$deleted_inline_comments" != "[]" ]]; then
+        emit_events_human_or_json "inline_comment_deleted" "$deleted_inline_comments" "$json_mode" "$timestamp"
       fi
     fi
 
@@ -253,6 +282,20 @@ EOF
       fi
     fi
 
+    # Emit an event when the PR description (body) is edited
+    if [[ "$curr_body" != "$prev_body" ]]; then
+      if [[ "$json_mode" == true ]]; then
+        jq -n \
+          --arg type "description" \
+          --arg timestamp "$timestamp" \
+          --arg from "$prev_body" \
+          --arg to "$curr_body" \
+          '{type: $type, time: $timestamp, data: {from: $from, to: $to}}'
+      else
+        echo "[${timestamp:11:8}] PR description edited"
+      fi
+    fi
+
     # Update previous state. inline_comments/prev_inline_comments is left alone on a
     # failed fetch (see inline_fetch_status above) so the next successful poll diffs
     # against the last known-good snapshot instead of replaying everything as new.
@@ -265,6 +308,7 @@ EOF
     prev_checks="$curr_checks"
     prev_mergeable="$curr_mergeable"
     prev_merge_state="$curr_merge_state"
+    prev_body="$curr_body"
 
     # Check --until-mergeable condition
     if [[ "$until_mergeable" == true ]]; then
@@ -294,14 +338,23 @@ emit_events_human_or_json() {
       comment)
         jq -r --arg ts "$hhmmss" '.[] | "[" + $ts + "] comment by @\(.author.login // .user.login): \(.body | gsub("[[:cntrl:]]"; " ") | .[0:80])"' <<<"$events_json"
         ;;
+      comment_deleted)
+        jq -r --arg ts "$hhmmss" '.[] | "[" + $ts + "] comment deleted (was by @\(.author.login // .user.login)): \(.body | gsub("[[:cntrl:]]"; " ") | .[0:80])"' <<<"$events_json"
+        ;;
       review)
         jq -r --arg ts "$hhmmss" '.[] | "[" + $ts + "] review by @\(.author.login): \(.state)"' <<<"$events_json"
+        ;;
+      review_deleted)
+        jq -r --arg ts "$hhmmss" '.[] | "[" + $ts + "] review deleted (was by @\(.author.login), state was \(.state))"' <<<"$events_json"
         ;;
       review_request)
         jq -r --arg ts "$hhmmss" '.[] | "[" + $ts + "] review requested from @\(.login // .name)"' <<<"$events_json"
         ;;
       inline_comment)
         jq -r --arg ts "$hhmmss" '.[] | "[" + $ts + "] inline comment by @\(.user.login) on \(.path):\(.line // .original_line): \(.body | gsub("[[:cntrl:]]"; " ") | .[0:80])"' <<<"$events_json"
+        ;;
+      inline_comment_deleted)
+        jq -r --arg ts "$hhmmss" '.[] | "[" + $ts + "] inline comment deleted (was by @\(.user.login) on \(.path):\(.line // .original_line)): \(.body | gsub("[[:cntrl:]]"; " ") | .[0:80])"' <<<"$events_json"
         ;;
       check)
         jq -r --arg ts "$hhmmss" '.[] | "[" + $ts + "] check \"\(.name // .context)\": \(.conclusion // .state // .status)"' <<<"$events_json"
