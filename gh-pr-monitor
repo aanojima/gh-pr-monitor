@@ -1,0 +1,348 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Diff two JSON arrays by a key field, returning elements that are new or changed.
+# prev/curr are passed on stdin (not --argjson) so large PR payloads (long comment
+# bodies, many inline comments) never hit the OS argv-size limit.
+diff_by_key() {
+  local prev="$1" curr="$2" key="$3"
+  jq -c -n --arg key "$key" '
+    (input) as $prev
+    | (input) as $curr
+    | ($prev | map({(.[$key] | tostring): .}) | add // {}) as $p
+    | [ $curr[] | select(($p[(.[$key] | tostring)] // null) != .) ]
+  ' <<<"$prev"$'\n'"$curr"
+}
+
+main() {
+  local interval=15
+  local once_mode=false
+  local json_mode=false
+  local until_mergeable=false
+  local target_args=()
+  local repo_args=()
+
+  # Parse arguments
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h | --help)
+        cat <<'EOF'
+Usage: gh pr-monitor [<pr-number> | <pr-url> | <branch>] [OPTIONS]
+
+Options:
+  --interval <seconds>   Polling interval in seconds (default 15)
+  --once                 Single poll, no loop
+  --json                 Output newline-delimited JSON events
+  --until-mergeable      Stop when PR is ready to merge
+  --repo <owner>/<repo>  GitHub repository
+  -h, --help             Show this help message
+
+Examples:
+  gh pr-monitor 42 --repo owner/repo
+  gh pr-monitor --json | jq .
+  gh pr-monitor --until-mergeable
+EOF
+        exit 0
+        ;;
+      --interval)
+        if [[ $# -lt 2 ]]; then
+          echo "Error: --interval requires a value" >&2
+          exit 1
+        fi
+        shift
+        interval="$1"
+        if ! [[ "$interval" =~ ^[0-9]+$ ]] || [[ "$interval" -le 0 ]]; then
+          echo "Error: --interval must be a positive integer" >&2
+          exit 1
+        fi
+        ;;
+      --interval=*)
+        interval="${1#--interval=}"
+        if ! [[ "$interval" =~ ^[0-9]+$ ]] || [[ "$interval" -le 0 ]]; then
+          echo "Error: --interval must be a positive integer" >&2
+          exit 1
+        fi
+        ;;
+      --once)
+        once_mode=true
+        ;;
+      --json)
+        json_mode=true
+        ;;
+      --until-mergeable)
+        until_mergeable=true
+        ;;
+      --repo)
+        if [[ $# -lt 2 ]]; then
+          echo "Error: --repo requires a value" >&2
+          exit 1
+        fi
+        shift
+        repo_args=(--repo "$1")
+        ;;
+      --repo=*)
+        repo_args=(--repo "${1#--repo=}")
+        ;;
+      *)
+        target_args+=("$1")
+        ;;
+    esac
+    shift
+  done
+
+  # Preflight checks
+  if ! command -v gh &>/dev/null; then
+    echo "gh CLI not found in PATH" >&2
+    exit 1
+  fi
+  if ! command -v jq &>/dev/null; then
+    echo "jq not found in PATH — required for parsing" >&2
+    exit 1
+  fi
+
+  # Fetch initial PR data
+  local pr_json
+  if ! pr_json=$(gh pr view "${target_args[@]+"${target_args[@]}"}" "${repo_args[@]+"${repo_args[@]}"}" --json number,url,state,comments,reviews,reviewRequests,reviewDecision,statusCheckRollup,mergeable,mergeStateStatus 2>&1); then
+    echo "$pr_json" >&2
+    exit 1
+  fi
+
+  local pr_number owner_repo pr_url
+  pr_number=$(jq -r '.number' <<<"$pr_json")
+  pr_url=$(jq -r '.url' <<<"$pr_json")
+  owner_repo=$(jq -r '.url' <<<"$pr_json" | sed -E 's#https?://[^/]+/([^/]+/[^/]+)/pull/.*#\1#')
+
+  # Fetch inline comments
+  local inline_comments_json
+  inline_comments_json=$(gh api "repos/$owner_repo/pulls/$pr_number/comments" --paginate 2>/dev/null || echo '[]')
+
+  # In --once mode, just print current state
+  if [[ "$once_mode" == true ]]; then
+    local snapshot_ts
+    snapshot_ts=$(date -u +%FT%TZ)
+    if [[ "$json_mode" == true ]]; then
+      jq -c --arg ts "$snapshot_ts" '{type: "snapshot", time: $ts, data: {number: .number, url: .url, state: .state, reviewDecision: .reviewDecision, mergeStateStatus: .mergeStateStatus, mergeable: .mergeable}}' <<<"$pr_json"
+    else
+      local decision merge_state mergeable pr_state
+      pr_state=$(jq -r '.state // "UNKNOWN"' <<<"$pr_json")
+      decision=$(jq -r '(.reviewDecision // "") | if . == "" then "NONE" else . end' <<<"$pr_json")
+      merge_state=$(jq -r '.mergeStateStatus // "UNKNOWN"' <<<"$pr_json")
+      mergeable=$(jq -r '.mergeable // "unknown"' <<<"$pr_json")
+      echo "PR #$pr_number"
+      echo "  URL: $pr_url"
+      echo "  State: $pr_state"
+      echo "  Review decision: $decision"
+      echo "  Merge state: $merge_state"
+      echo "  Mergeable: $mergeable"
+    fi
+    # With --until-mergeable, --once reports readiness via exit code instead of
+    # always succeeding — a caller doing `gh pr-monitor --once --until-mergeable && merge`
+    # must not see success on a PR that isn't actually ready.
+    if [[ "$until_mergeable" == true ]]; then
+      if check_mergeable "$pr_json"; then exit 0; else exit 1; fi
+    fi
+    exit 0
+  fi
+
+  # Print startup banner to stderr
+  echo "watching PR #$pr_number ($pr_url), polling every ${interval}s ..." >&2
+
+  # Initialize state
+  local prev_comments prev_reviews prev_review_requests prev_inline_comments prev_checks prev_mergeable prev_merge_state
+  prev_comments=$(jq -c '.comments // []' <<<"$pr_json")
+  prev_reviews=$(jq -c '.reviews // []' <<<"$pr_json")
+  prev_review_requests=$(jq -c '.reviewRequests // []' <<<"$pr_json")
+  prev_inline_comments="$inline_comments_json"
+  prev_checks=$(jq -c '.statusCheckRollup // []' <<<"$pr_json")
+  prev_mergeable=$(jq -r '.mergeable' <<<"$pr_json")
+  prev_merge_state=$(jq -r '.mergeStateStatus' <<<"$pr_json")
+
+  # Main polling loop
+  while true; do
+    sleep "$interval"
+
+    # Fetch updated PR data
+    if ! pr_json=$(gh pr view "${target_args[@]+"${target_args[@]}"}" "${repo_args[@]+"${repo_args[@]}"}" --json number,url,state,comments,reviews,reviewRequests,reviewDecision,statusCheckRollup,mergeable,mergeStateStatus 2>&1); then
+      echo "$pr_json" >&2
+      exit 1
+    fi
+
+    # A closed/merged PR never reaches mergeStateStatus CLEAN again, so without this
+    # check --until-mergeable (and a plain watch) would poll it forever.
+    local pr_state
+    pr_state=$(jq -r '.state // "OPEN"' <<<"$pr_json")
+    if [[ "$pr_state" != "OPEN" ]]; then
+      echo "PR #$pr_number is $pr_state — nothing more to watch." >&2
+      exit 0
+    fi
+
+    local inline_fetch_status=0
+    inline_comments_json=$(gh api "repos/$owner_repo/pulls/$pr_number/comments" --paginate 2>/dev/null) || inline_fetch_status=$?
+
+    # Extract current state
+    local curr_comments curr_reviews curr_review_requests curr_checks curr_mergeable curr_merge_state
+    curr_comments=$(jq -c '.comments // []' <<<"$pr_json")
+    curr_reviews=$(jq -c '.reviews // []' <<<"$pr_json")
+    curr_review_requests=$(jq -c '.reviewRequests // []' <<<"$pr_json")
+    curr_checks=$(jq -c '.statusCheckRollup // []' <<<"$pr_json")
+    curr_mergeable=$(jq -r '.mergeable' <<<"$pr_json")
+    curr_merge_state=$(jq -r '.mergeStateStatus' <<<"$pr_json")
+
+    local timestamp
+    timestamp=$(date -u +%FT%TZ)
+
+    # Emit events for changed comments
+    local new_comments
+    new_comments=$(diff_by_key "$prev_comments" "$curr_comments" "id")
+    if [[ -n "$new_comments" && "$new_comments" != "[]" ]]; then
+      emit_events_human_or_json "comment" "$new_comments" "$json_mode" "$timestamp"
+    fi
+
+    # Emit events for changed reviews
+    local new_reviews
+    new_reviews=$(diff_by_key "$prev_reviews" "$curr_reviews" "id")
+    if [[ -n "$new_reviews" && "$new_reviews" != "[]" ]]; then
+      emit_events_human_or_json "review" "$new_reviews" "$json_mode" "$timestamp"
+    fi
+
+    # Emit events for review requests (key by login/team name — these objects have no stable id)
+    local new_review_requests
+    new_review_requests=$(diff_by_key \
+      "$(jq -c 'map(. + {id: (.login // .name)})' <<<"$prev_review_requests")" \
+      "$(jq -c 'map(. + {id: (.login // .name)})' <<<"$curr_review_requests")" \
+      "id" | jq -c 'map(del(.id))')
+    if [[ -n "$new_review_requests" && "$new_review_requests" != "[]" ]]; then
+      emit_events_human_or_json "review_request" "$new_review_requests" "$json_mode" "$timestamp"
+    fi
+
+    # Emit events for inline comments — skip entirely on a transient fetch failure so a
+    # network blip doesn't replay every existing inline comment as "new" on the next poll.
+    if [[ "$inline_fetch_status" -eq 0 ]]; then
+      local new_inline_comments
+      new_inline_comments=$(diff_by_key "$prev_inline_comments" "$inline_comments_json" "id")
+      if [[ -n "$new_inline_comments" && "$new_inline_comments" != "[]" ]]; then
+        emit_events_human_or_json "inline_comment" "$new_inline_comments" "$json_mode" "$timestamp"
+      fi
+    fi
+
+    # Emit events for status checks. Key by detailsUrl/targetUrl (unique per run) rather
+    # than name/context — reruns and matrix jobs routinely share the same check name, and
+    # keying by name alone would flag an unchanged check as "changed" on every poll.
+    local new_checks
+    new_checks=$(diff_by_key \
+      "$(jq -c 'map(. + {id: (.detailsUrl // .targetUrl // .name // .context // (. | @json))})' <<<"$prev_checks")" \
+      "$(jq -c 'map(. + {id: (.detailsUrl // .targetUrl // .name // .context // (. | @json))})' <<<"$curr_checks")" \
+      "id" | jq -c 'map(del(.id))')
+    if [[ -n "$new_checks" && "$new_checks" != "[]" ]]; then
+      emit_events_human_or_json "check" "$new_checks" "$json_mode" "$timestamp"
+    fi
+
+    # Emit events for mergeable state changes
+    if [[ "$curr_mergeable" != "$prev_mergeable" ]] || [[ "$curr_merge_state" != "$prev_merge_state" ]]; then
+      if [[ "$json_mode" == true ]]; then
+        jq -n \
+          --arg type "mergeable" \
+          --arg timestamp "$timestamp" \
+          --arg from_mergeable "$prev_mergeable" \
+          --arg to_mergeable "$curr_mergeable" \
+          --arg from_state "$prev_merge_state" \
+          --arg to_state "$curr_merge_state" \
+          '{type: $type, time: $timestamp, data: {from: {mergeable: $from_mergeable, state: $from_state}, to: {mergeable: $to_mergeable, state: $to_state}}}'
+      else
+        echo "[${timestamp:11:8}] mergeable state changed: {$prev_mergeable,$prev_merge_state} -> {$curr_mergeable,$curr_merge_state}"
+      fi
+    fi
+
+    # Update previous state. inline_comments/prev_inline_comments is left alone on a
+    # failed fetch (see inline_fetch_status above) so the next successful poll diffs
+    # against the last known-good snapshot instead of replaying everything as new.
+    prev_comments="$curr_comments"
+    prev_reviews="$curr_reviews"
+    prev_review_requests="$curr_review_requests"
+    if [[ "$inline_fetch_status" -eq 0 ]]; then
+      prev_inline_comments="$inline_comments_json"
+    fi
+    prev_checks="$curr_checks"
+    prev_mergeable="$curr_mergeable"
+    prev_merge_state="$curr_merge_state"
+
+    # Check --until-mergeable condition
+    if [[ "$until_mergeable" == true ]]; then
+      if check_mergeable "$pr_json"; then
+        echo "✓ PR is mergeable: all checks passing, approved, no conflicts" >&2
+        exit 0
+      fi
+    fi
+  done
+}
+
+emit_events_human_or_json() {
+  local event_type="$1" events_json="$2" json_mode="$3" timestamp="$4"
+
+  if [[ "$json_mode" == true ]]; then
+    jq -c \
+      --arg type "$event_type" \
+      --arg timestamp "$timestamp" \
+      'map({type: $type, time: $timestamp, data: .})[]' <<<"$events_json"
+  else
+    # HH:MM:SS carved out of the shared per-poll UTC timestamp (not jq's `now`), so every
+    # line printed for the same poll shares one clock instead of drifting between calls,
+    # and control characters (CR, ESC, ...) in user-supplied bodies are stripped so a
+    # crafted comment body can't forge terminal output or clear the screen.
+    local hhmmss="${timestamp:11:8}"
+    case "$event_type" in
+      comment)
+        jq -r --arg ts "$hhmmss" '.[] | "[" + $ts + "] comment by @\(.author.login // .user.login): \(.body | gsub("[[:cntrl:]]"; " ") | .[0:80])"' <<<"$events_json"
+        ;;
+      review)
+        jq -r --arg ts "$hhmmss" '.[] | "[" + $ts + "] review by @\(.author.login): \(.state)"' <<<"$events_json"
+        ;;
+      review_request)
+        jq -r --arg ts "$hhmmss" '.[] | "[" + $ts + "] review requested from @\(.login // .name)"' <<<"$events_json"
+        ;;
+      inline_comment)
+        jq -r --arg ts "$hhmmss" '.[] | "[" + $ts + "] inline comment by @\(.user.login) on \(.path):\(.line // .original_line): \(.body | gsub("[[:cntrl:]]"; " ") | .[0:80])"' <<<"$events_json"
+        ;;
+      check)
+        jq -r --arg ts "$hhmmss" '.[] | "[" + $ts + "] check \"\(.name // .context)\": \(.conclusion // .state // .status)"' <<<"$events_json"
+        ;;
+    esac
+  fi
+}
+
+check_mergeable() {
+  local pr_json="$1"
+
+  # Check: reviewDecision == "APPROVED"
+  local review_decision
+  review_decision=$(jq -r '.reviewDecision // "NONE"' <<<"$pr_json")
+  [[ "$review_decision" == "APPROVED" ]] || return 1
+
+  # Check: mergeStateStatus == "CLEAN"
+  local merge_state
+  merge_state=$(jq -r '.mergeStateStatus // "UNKNOWN"' <<<"$pr_json")
+  [[ "$merge_state" == "CLEAN" ]] || return 1
+
+  # Check: every check has a non-blocking resolution. Resolve each check to a single
+  # status string (conclusion for a finished CheckRun, state for a legacy commit Status,
+  # or status ["IN_PROGRESS"/"QUEUED"] for one still running) and require it to be in the
+  # explicit pass set. statusCheckRollup is null (not []) when no CI is configured at all.
+  # An explicit pass-set (rather than a fail-set) is required for correctness: GitHub
+  # treats NEUTRAL as non-blocking, so it must pass here, while TIMED_OUT/CANCELLED/
+  # ACTION_REQUIRED/STALE/STARTUP_FAILURE must all block — a fail-set has to enumerate
+  # every one of those to be safe, whereas the pass-set is just three values.
+  local all_passing
+  all_passing=$(jq '
+    (.statusCheckRollup // [])
+    | map(.conclusion // .state // .status // "PENDING")
+    | all(IN("SUCCESS", "NEUTRAL", "SKIPPED"))
+  ' <<<"$pr_json")
+  [[ "$all_passing" == "true" ]] || return 1
+
+  return 0
+}
+
+# Guard to allow sourcing without executing
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi
